@@ -1,2 +1,8 @@
 # IS 6813 Swire Cart Abandonment
 As part of my Capstone project, I worked in a team of 3 (including me) to work through the issue of cart abandonments on an online platform. Our task was to analyze customer behavior to determine the cause and effect towards abandonment and recommendations to reduce it.
+
+## Business Problem
+MyCoke360 experiences a high rate of cart abandonment where customers add products but fail to complete the purchase before their order window closes. The objective of this project is to analyze user behavior within each order window to understand what actions or patterns lead to abandonment and why customers fail to convert. By identifying the behavioral patterns most associated with the drop off, we can deliver actionable insights that can help Swire reduce lost orders and improve the platform’s overall conversion performance. As a result of lowering abandonment rate, Swire captures more of the potential revenue that would otherwise be lost.
+
+## Solution
+Our group’s solution was to model cart abandonment using behavioral sequences that consist of a sequence of actions, rather than single events. Raw event level models performed poorly, so we engineered features that reflected how customers actually move through an order window. This includes how much they browse, whether they start checkout, and whether they remove items after adding them. Once we modeled these behaviors, predictive performance improved dramatically. The strongest drivers of abandonment became clear which we found were heavy browsing without checkout, removing items after adding them, and a lack of checkout progress. These patterns give Swire clear points of intervention to reduce abandonment and recover lost orders.
