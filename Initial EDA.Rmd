@@ -1,0 +1,245 @@
+---
+title: "Capstone"
+author: "Carl Freeze"
+date: "2025-09-26"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    self_contained: true
+---
+
+# Library
+
+```{r setup, include=FALSE}
+google <- read.csv("google_analytics.csv")
+orders <- read.csv("orders.csv")
+visits <- read.csv("visit_plan.csv")
+cutoff <- read.csv("cutoff_times.csv")
+```
+
+# Data Cleaning
+
+```{r}
+# Columns changed to characters for google file
+google$CUSTOMER_ID <- trimws(as.character(google$CUSTOMER_ID))
+google$EVENT_TIMESTAMP <- as.character(google$EVENT_TIMESTAMP)
+google$EVENT_DATE <- as.character(google$EVENT_DATE)
+google$EVENT_NAME <- as.character(google$EVENT_NAME)
+google$DEVICE_CATEGORY <- as.character(google$DEVICE_CATEGORY)
+google$EVENT_PAGE_NAME <- as.character(google$EVENT_PAGE_NAME)
+google$EVENT_PAGE_TITLE <- as.character(google$EVENT_PAGE_TITLE)
+
+# Create a DAY column from EVENT_DATE. If missing, backfill using first characters of EVENT_TIMESTAMP
+google$DAY <- as.Date(google$EVENT_DATE, format = "%m/%d/%Y")
+if (any(is.na(google$DAY))) {
+  miss <- is.na(google$DAY)
+  google$DAY[miss] <- as.Date(substr(google$EVENT_TIMESTAMP[miss], 1, 10))}
+
+# Make a normalized EVENT_NAME column for matching and keep the original
+google$EVENT_NAME_NORM <- tolower(trimws(google$EVENT_NAME))
+
+# Columns changed for characters and timestamp for order file
+orders$CUSTOMER_ID <- trimws(as.character(orders$CUSTOMER_ID))    
+orders$CREATED_DATE_UTC <- as.character(orders$CREATED_DATE_UTC)       
+orders$ORDER_TIME <- as.POSIXct(orders$CREATED_DATE_UTC, tz = "UTC")
+
+# Customer ID changed to text for visit plan file
+visits$CUSTOMER_ID <- trimws(as.character(visits$CUSTOMER_ID))   
+
+# Snapshot timestamp used to pick the policy
+# ELT_TS created into real timestamps and if its just a date, make it midnight
+if ("ELT_TS" %in% names(visits)) {
+  visits$SNAP_TS <- as.POSIXct(as.character(visits$ELT_TS), tz = "UTC")
+} else if ("SNAPSHOT_DATE" %in% names(visits)) {
+  visits$SNAP_TS <- as.POSIXct(paste(as.character(visits$SNAPSHOT_DATE), "00:00:00"), tz = "UTC")
+} else {
+  visits$SNAP_TS <- NA
+}
+# Anchor_DATE into a weekday 
+# If Frequency is missing, assume it is weekly
+if ("ANCHOR_DATE" %in% names(visits)) visits$ANCHOR_DATE <- as.Date(visits$ANCHOR_DATE)
+if (!"FREQUENCY" %in% names(visits))  visits$FREQUENCY   <- 1L  
+```
+
+# Random Sample
+
+```{r}
+# Sample by CUSTOMER_ID so files join correctly
+
+# Choose customers who had an add_to_cart
+set.seed(123)
+intent_ids <- unique(google$CUSTOMER_ID[google$EVENT_NAME_NORM == "add_to_cart"])
+
+# Sample up to 50,000 of those intent customers
+target_n  <- 50000L
+sample_n  <- min(length(intent_ids), target_n)
+sample_ids <- sample(intent_ids, size = sample_n, replace = FALSE)
+
+# Filter every dataset to the customers sampled 
+google <- google[google$CUSTOMER_ID %in% sample_ids, ]
+orders <- orders[orders$CUSTOMER_ID %in% sample_ids, ]
+visits <- visits[visits$CUSTOMER_ID %in% sample_ids, ]
+
+# 4) Sanity prints
+cat("Sampled customers:", length(sample_ids), "\n")
+cat("Rows For: Google:", nrow(google), " | Orders:", nrow(orders), " | Visit Plan:", nrow(visits), "\n")
+cat("add_to_cart events (sample):", sum(google$EVENT_NAME_NORM == "add_to_cart", na.rm = TRUE), "\n")
+```
+
+
+# Relationship Between Device and Abandonment
+
+```{r}
+# ABANDONED_PROXY is when customer-day has add_to_cart AND NO purchase on that day
+
+# Make per-customer-day flags from google file
+tmp <- google[, c("CUSTOMER_ID","DAY","EVENT_NAME_NORM")]
+
+has_add <- aggregate(EVENT_NAME_NORM ~ CUSTOMER_ID + DAY, tmp, function(x) any(x == "add_to_cart"))
+names(has_add)[3] <- "HAS_ADD"
+
+has_purchase <- aggregate(EVENT_NAME_NORM ~ CUSTOMER_ID + DAY, tmp, function(x) any(x == "purchase"))
+names(has_purchase)[3] <- "HAS_PURCHASE"
+
+lab <- merge(has_add, has_purchase, by = c("CUSTOMER_ID","DAY"), all.x = TRUE)
+lab$HAS_PURCHASE[is.na(lab$HAS_PURCHASE)] <- FALSE
+lab$ABANDONED_PROXY <- lab$HAS_ADD & !lab$HAS_PURCHASE
+
+# Keep only intent days with add to carts
+lab <- lab[lab$HAS_ADD, c("CUSTOMER_ID","DAY","ABANDONED_PROXY")]
+
+# Attach the first device seen on each customer-day
+ord <- order(google$CUSTOMER_ID, google$DAY, google$EVENT_TIMESTAMP)
+first_device <- google[ord, c("CUSTOMER_ID","DAY","DEVICE_CATEGORY")]
+first_device <- first_device[!duplicated(first_device[, c("CUSTOMER_ID","DAY")]), ]
+
+cd_dev <- merge(lab, first_device, by = c("CUSTOMER_ID","DAY"), all.x = TRUE)
+
+# % abandoned within each device
+tab_raw <- with(cd_dev, table(DEVICE_CATEGORY, ABANDONED_PROXY))
+
+dev_pct <- if (!"TRUE" %in% colnames(tab_raw)) {
+  setNames(rep(0, nrow(tab_raw)), rownames(tab_raw))
+} else if (!"FALSE" %in% colnames(tab_raw)) {
+  setNames(rep(1, nrow(tab_raw)), rownames(tab_raw))
+} else {
+  prop.table(tab_raw, 1)[, "TRUE"]
+}
+
+# % abandoned by device high to low
+sort(round(100 * dev_pct, 1), decreasing = TRUE)
+```
+
+# Event Rankings Toward Abandonment
+
+```{r}
+
+# Build the proxy label per CUSTOMER_ID × DAY
+tmp <- google[, c("CUSTOMER_ID","DAY","EVENT_NAME_NORM")]
+
+has_add <- aggregate(EVENT_NAME_NORM ~ CUSTOMER_ID + DAY, tmp, function(x) any(x == "add_to_cart"))
+names(has_add)[3] <- "HAS_ADD"
+
+has_purchase <- aggregate(EVENT_NAME_NORM ~ CUSTOMER_ID + DAY, tmp, function(x) any(x == "purchase"))
+names(has_purchase)[3] <- "HAS_PURCHASE"
+
+lab <- merge(has_add, has_purchase, by = c("CUSTOMER_ID","DAY"), all.x = TRUE)
+lab$HAS_PURCHASE[is.na(lab$HAS_PURCHASE)] <- FALSE
+lab$ABANDONED_PROXY <- lab$HAS_ADD & !lab$HAS_PURCHASE
+
+# # Keep only intent days with add to carts
+lab <- lab[lab$HAS_ADD, c("CUSTOMER_ID","DAY","ABANDONED_PROXY")]
+
+# Attach the label to each event row by CUSTOMER_ID + DAY
+events_labeled <- merge(
+  lab,
+  google[, c("CUSTOMER_ID","DAY","EVENT_NAME_NORM")],
+  by = c("CUSTOMER_ID","DAY"),
+  all.x = TRUE)
+
+# Count events for abandoned vs completed
+tab_e  <- with(events_labeled, table(EVENT_NAME_NORM, ABANDONED_PROXY))
+prop_e <- prop.table(tab_e, 2)  # within each outcome column
+
+# Compute lift
+events_top <- data.frame(
+  EVENT_NAME       = rownames(tab_e),
+  COUNT_COMPLETED  = as.integer(tab_e[, "FALSE"]),
+  COUNT_ABANDONED  = as.integer(tab_e[, "TRUE"]),
+  LIFT             = prop_e[, "TRUE"] - prop_e[, "FALSE"],
+  row.names = NULL)
+
+# Rank highest positive lift first
+events_top <- events_top[order(-events_top$LIFT, -events_top$COUNT_ABANDONED), ]
+
+# Top 10 events most associated with abandonment
+head(events_top, 10)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
